@@ -40,7 +40,12 @@ def _build_provider_pool() -> list[dict[str, str]]:
         for index, key in enumerate(POS_AI_PROVIDER_KEYS):
             url = POS_AI_PROVIDER_URLS[index] if index < len(POS_AI_PROVIDER_URLS) else POS_AI_API_URL
             model = POS_AI_PROVIDER_MODELS[index] if index < len(POS_AI_PROVIDER_MODELS) else POS_AI_MODEL
-            provider = "github_models" if "models.github" in url else POS_AI_API_PROVIDER
+            if "models.github" in url:
+                provider = "github_models"
+            elif "googleapis.com" in url:
+                provider = "gemini"
+            else:
+                provider = POS_AI_API_PROVIDER
             pool.append(
                 {
                     "name": f"provider_{index + 1}",
@@ -231,10 +236,11 @@ async def pos_chat_completion(
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                     "top_p": top_p,
-                    "frequency_penalty": 0.35,
-                    "presence_penalty": 0.2,
                     "stream": False,
                 }
+                if "googleapis.com" not in provider["api_url"] and provider["provider"] != "gemini":
+                    payload["frequency_penalty"] = 0.35
+                    payload["presence_penalty"] = 0.2
                 if tools:
                     payload["tools"] = tools
                 headers = {
@@ -277,10 +283,14 @@ async def pos_chat_completion(
                         if resp.status >= 400:
                             if provider["provider"] == "github_models" and resp.status in {401, 403}:
                                 print("P.OS GitHub Models auth error.")
-                            print(f"P.OS API error {resp.status}: {response_text[:500]}")
+                            print(f"P.OS API error {resp.status} ({provider['name']}): {response_text[:500]}")
+                            # Cool down this provider for 1 hour to prevent hitting bad credentials/models repeatedly
+                            _provider_backoff_until[provider_index] = time.monotonic() + 3600.0
+                            if attempt < max_attempts - 1:
+                                continue
                             return None
         except asyncio.TimeoutError:
-            print(f"P.OS API timeout. Attempting fallback.")
+            print(f"P.OS API timeout for {provider['name']}. Attempting fallback.")
             if attempt < max_attempts - 1:
                 continue
             return None
@@ -288,9 +298,11 @@ async def pos_chat_completion(
             exc_str = str(exc).lower()
             if "rate" in exc_str or "limit" in exc_str or "quota" in exc_str:
                 _provider_backoff_until[provider_index] = time.monotonic() + 20.0
-                if attempt < max_attempts - 1:
-                    continue
-            print(f"P.OS API request failed: {exc}")
+            else:
+                _provider_backoff_until[provider_index] = time.monotonic() + 60.0
+            print(f"P.OS API request failed ({provider['name']}): {exc}")
+            if attempt < max_attempts - 1:
+                continue
             return None
 
         # Success
