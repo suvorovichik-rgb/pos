@@ -124,20 +124,17 @@ UPDATE_LOG_MARKER = os.getenv("UPDATE_LOG_MARKER", "psc-helper-release-0.5.1")
 SUSPICIOUS_KEYWORDS = [
     # NSFW / adult
     "porn", "porno", "xxx", "sex", "adult", "erotic", "erotica", "fetish",
-    "fetlife", "cam", "cams", "tube", "sexchat", "onlyfans", "adultfriendfinder",
+    "fetlife", "cam4", "cams", "tube", "sexchat", "onlyfans", "adultfriendfinder",
     "escort", "escortservice", "webcam", "nsfw", "honeypot",
     # gambling
-    "casino", "casinos", "bet", "bets", "betting", "poker", "slot", "slots",
-    "roulette", "blackjack", "baccarat", "spin", "jackpot", "1xbet", "bet365",
-    "stake", "pinnacle", "bookmaker", "betway", "pokerstars",
-    # scams / freebies / nitro / robux
+    "casino", "casinos", "1xbet", "bet365", "betway", "pokerstars",
+    "roulette", "blackjack", "baccarat", "jackpot", "pinnacle", "bookmaker",
+    # scams / freebies / nitro / robux — ТОЛЬКО высокоуверенные маркеры
     "free-robux", "robuxfree", "freegift", "free-nitro", "nitro-free", "getnitro",
     "nitrogiveaway", "nitroclaim", "discord-nitro", "discordgift", "discord-gift",
-    "hack", "cheat", "generator", "gens", "prize", "claim", "giveaway", "earn",
-    # phishing / account theft
-    "login", "signin", "securelogin", "account-recovery", "accountverify",
-    "verify-account", "verify", "verification", "auth", "password-reset", "login-roblox",
-    "paypal-secure", "wallet-connect", "metamasklogin"
+    # phishing — ТОЛЬКО очевидные фишинг-слова, НЕ общие слова типа verify/auth/login
+    "paypal-secure", "wallet-connect", "metamasklogin", "login-roblox",
+    "accountverify", "verify-account", "password-reset", "account-recovery",
 ]
 
 SUSPICIOUS_DOMAINS = {
@@ -151,8 +148,10 @@ SUSPICIOUS_DOMAINS = {
 }
 
 SUSPICIOUS_PATH_KEYWORDS = [
-    "claim", "free", "giveaway", "get-nitro", "nitro", "free-robux",
-    "verify", "verification", "password", "reset", "voucher", "coupon", "earn"
+    "free-nitro", "get-nitro", "nitro", "free-robux",
+    "discord-gift", "discordgift", "nitroclaim",
+    "wallet-connect", "metamask", "paypal-secure",
+    "password-reset", "account-recovery", "accountverify",
 ]
 
 WHITELIST_DOMAINS = {
@@ -197,7 +196,7 @@ FORM_CHANNEL_ID = 1510201947024789665
 
 TAC_CHANNEL_ID = 1394635110665556009
 TAC_REVIEWER_ROLE_IDS = [1341041194733670401, 1341040607728107591, 1341040703551307846]
-TAC_ROLE_REWARDS = [1341040784723411017, 1341040871562285066, 1341100562783014965, 1341039967555551333]
+TAC_ROLE_REWARDS = [1510638596200206416, 1512855364071063654]
 
 VOICE_TIMEOUT_HOURS = 24
 VIOLATION_ATTACHMENT_LIMIT = 3
