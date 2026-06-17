@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import difflib
 import io
 import json
 import random as _random
@@ -15,6 +16,9 @@ from typing import List, Optional
 import discord
 from PIL import Image, ImageOps
 from discord.utils import escape_markdown, escape_mentions
+
+# #4: Защита от декомпрессионных бомб (см. moderation.py).
+Image.MAX_IMAGE_PIXELS = 24_000_000
 
 from ai_client import (
     ai_cooldown_remaining,
@@ -34,7 +38,7 @@ from config import (
     POS_OWNER_USER_IDS,
 )
 from commands import generate_gif_from_attachments, parse_gif_options_from_text
-from logging_utils import is_log_channel
+from logging_utils import is_log_channel, setup_guild_logging
 from storage import add_entry, delete_entry, list_entries, get_ai_context, update_ai_context, is_ai_muted, set_ai_muted_user
 from cogs.ai_tools import POS_AI_TOOLS
 
@@ -43,8 +47,82 @@ from cogs.ai_tools import POS_AI_TOOLS
 _OWNER_ONLY_TOOLS = frozenset({
     "ban_user", "unban_user", "timeout_user",
     "add_role", "remove_role",
+    "create_role", "delete_role", "delete_messages",
+    "setup_logging",
     "mute_ai_for_user", "unmute_ai_for_user",
 })
+
+
+def _normalize_role_name(name: str) -> str:
+    """Приводит имя роли к виду для нечёткого сравнения: только буквы/цифры, нижний
+    регистр. Убирает эмодзи, пробелы, пунктуацию и декоративные символы."""
+    return re.sub(r"[^0-9a-zа-яё]", "", (name or "").lower())
+
+
+def resolve_role_smart(guild: discord.Guild, ident: str) -> discord.Role | None:
+    """Находит роль по ID, точному имени, нормализованному имени, подстроке или
+    нечёткому совпадению. Возвращает None, если уверенного совпадения нет."""
+    if not ident:
+        return None
+    ident = str(ident).strip()
+
+    # 1. По ID (в т.ч. формат <@&123>)
+    digits = re.sub(r"[^0-9]", "", ident)
+    if digits and ident.replace("<@&", "").replace(">", "").strip().isdigit():
+        role = guild.get_role(int(digits))
+        if role:
+            return role
+
+    roles = [r for r in guild.roles if r.name != "@everyone"]
+
+    # 2. Точное совпадение имени (без учёта регистра)
+    lowered = ident.lower()
+    for r in roles:
+        if r.name.lower() == lowered:
+            return r
+
+    # 3. Нормализованное совпадение (без эмодзи/пробелов/пунктуации)
+    norm = _normalize_role_name(ident)
+    if norm:
+        for r in roles:
+            if _normalize_role_name(r.name) == norm:
+                return r
+
+    # 4. Подстрока (предпочитаем самое длинное имя роли, чтобы не цеплять короткие)
+    if norm:
+        substring_hits = [r for r in roles if norm in _normalize_role_name(r.name) or _normalize_role_name(r.name) in norm]
+        if len(substring_hits) == 1:
+            return substring_hits[0]
+        if substring_hits:
+            return max(substring_hits, key=lambda r: len(r.name))
+
+    # 5. Нечёткое совпадение по нормализованным именам
+    if norm:
+        normalized_map = {_normalize_role_name(r.name): r for r in roles if _normalize_role_name(r.name)}
+        close = difflib.get_close_matches(norm, list(normalized_map.keys()), n=1, cutoff=0.82)
+        if close:
+            return normalized_map[close[0]]
+
+    return None
+
+
+def _role_not_found_hint(guild: discord.Guild, ident: str) -> str:
+    """Сообщение об ошибке с подсказкой похожих ролей, чтобы модель могла
+    повторить вызов с точным именем вместо «не знаю такую роль»."""
+    roles = [r.name for r in guild.roles if r.name != "@everyone"]
+    norm = _normalize_role_name(ident)
+    suggestions: list[str] = []
+    if norm:
+        normalized_map = {_normalize_role_name(n): n for n in roles if _normalize_role_name(n)}
+        close = difflib.get_close_matches(norm, list(normalized_map.keys()), n=3, cutoff=0.5)
+        suggestions = [normalized_map[c] for c in close]
+    if suggestions:
+        return (
+            f"Роль '{ident}' не найдена. Возможно, ты имел в виду: "
+            + ", ".join(f"'{s}'" for s in suggestions)
+            + ". Повтори вызов с точным именем или ID роли."
+        )
+    return f"Ошибка: роль '{ident}' не найдена на сервере."
 
 
 async def execute_pos_tool(bot: discord.Client, message: discord.Message | None, tool_call: dict) -> str:
@@ -59,7 +137,11 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
     except Exception:
         args = {}
 
-    user_id = int(args.get("user_id", 0)) if args.get("user_id") else None
+    raw_user_id = args.get("user_id")
+    try:
+        user_id = int(raw_user_id) if raw_user_id else None
+    except (ValueError, TypeError):
+        user_id = None
 
     # --- #1/#2: Все инструменты управления требуют прав владельца ---
     if name in _OWNER_ONLY_TOOLS:
@@ -70,9 +152,12 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
                 action_name = {
                     "ban_user": "бан", "unban_user": "разбан", "timeout_user": "мут",
                     "add_role": "выдачу роли", "remove_role": "снятие роли",
+                    "create_role": "создание роли", "delete_role": "удаление роли",
+                    "delete_messages": "удаление сообщений",
+                    "setup_logging": "разворачивание системы логов",
                     "mute_ai_for_user": "блокировку ответов", "unmute_ai_for_user": "снятие блокировки",
                 }.get(name, name)
-                user_name = getattr(message.guild.get_member(user_id), "name", str(user_id)) if user_id else str(user_id)
+                user_name = getattr(message.guild.get_member(user_id), "name", str(user_id)) if user_id else "не указан"
                 reason = args.get("reason", args.get("role_id_or_name", "Причина не указана"))
                 try:
                     await owner.send(
@@ -136,7 +221,7 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
     elif name == "add_role":
         if not user_id:
             return "Ошибка: не указан user_id"
-        role_ident = args.get("role_id_or_name", "")
+        role_ident = str(args.get("role_id_or_name", ""))
         member = message.guild.get_member(user_id)
         if not member:
             try:
@@ -145,23 +230,21 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
                 pass
         if not member:
             return "Ошибка: пользователь не найден."
-        role = None
-        if role_ident.isdigit():
-            role = message.guild.get_role(int(role_ident))
+        role = resolve_role_smart(message.guild, role_ident)
         if not role:
-            role = discord.utils.find(lambda r: r.name.lower() == role_ident.lower(), message.guild.roles)
-        if not role:
-            return f"Ошибка: роль '{role_ident}' не найдена."
+            return _role_not_found_hint(message.guild, role_ident)
         try:
             await member.add_roles(role, reason="Выдано P.OS")
             return f"Роль {role.name} успешно выдана пользователю {user_id}."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы выдать роль '{role.name}'. Проверь, что роль P.OS выше неё в иерархии."
         except Exception as e:
             return f"Ошибка при выдаче роли: {e}"
 
     elif name == "remove_role":
         if not user_id:
             return "Ошибка: не указан user_id"
-        role_ident = args.get("role_id_or_name", "")
+        role_ident = str(args.get("role_id_or_name", ""))
         member = message.guild.get_member(user_id)
         if not member:
             try:
@@ -170,18 +253,93 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
                 pass
         if not member:
             return "Ошибка: пользователь не найден."
-        role = None
-        if role_ident.isdigit():
-            role = message.guild.get_role(int(role_ident))
+        role = resolve_role_smart(message.guild, role_ident)
         if not role:
-            role = discord.utils.find(lambda r: r.name.lower() == role_ident.lower(), message.guild.roles)
-        if not role:
-            return f"Ошибка: роль '{role_ident}' не найдена."
+            return _role_not_found_hint(message.guild, role_ident)
         try:
             await member.remove_roles(role, reason="Снято P.OS")
             return f"Роль {role.name} успешно снята с пользователя {user_id}."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы снять роль '{role.name}'. Проверь иерархию ролей."
         except Exception as e:
             return f"Ошибка при снятии роли: {e}"
+
+    elif name == "create_role":
+        role_name = str(args.get("name", "")).strip()
+        if not role_name:
+            return "Ошибка: не указано имя роли (name)."
+        existing = resolve_role_smart(message.guild, role_name)
+        if existing and existing.name.lower() == role_name.lower():
+            return f"Роль с именем '{existing.name}' уже существует (ID {existing.id})."
+        color = discord.Color.default()
+        color_raw = str(args.get("color", "")).strip().lstrip("#")
+        if color_raw:
+            try:
+                color = discord.Color(int(color_raw, 16))
+            except (ValueError, TypeError):
+                color = discord.Color.default()
+        hoist = str(args.get("hoist", "")).lower() in {"true", "1", "да", "yes"}
+        mentionable = str(args.get("mentionable", "")).lower() in {"true", "1", "да", "yes"}
+        try:
+            new_role = await message.guild.create_role(
+                name=role_name,
+                color=color,
+                hoist=hoist,
+                mentionable=mentionable,
+                reason="Создано P.OS",
+            )
+            return f"Роль '{new_role.name}' создана (ID {new_role.id})."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав для создания роли (нужно право «Управление ролями»)."
+        except Exception as e:
+            return f"Ошибка при создании роли: {e}"
+
+    elif name == "delete_role":
+        role_ident = str(args.get("role_id_or_name", ""))
+        if not role_ident:
+            return "Ошибка: не указана роль (role_id_or_name)."
+        role = resolve_role_smart(message.guild, role_ident)
+        if not role:
+            return _role_not_found_hint(message.guild, role_ident)
+        if role.is_default() or role.managed:
+            return f"Ошибка: роль '{role.name}' системная или управляется интеграцией — её нельзя удалить."
+        role_name = role.name
+        try:
+            await role.delete(reason="Удалено P.OS")
+            return f"Роль '{role_name}' удалена с сервера."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы удалить роль '{role_name}'. Проверь иерархию ролей."
+        except Exception as e:
+            return f"Ошибка при удалении роли: {e}"
+
+    elif name == "delete_messages":
+        channel = message.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+            return "Ошибка: удаление сообщений доступно только в текстовых каналах."
+        try:
+            count = int(args.get("count", 0))
+        except (ValueError, TypeError):
+            count = 0
+        if count < 1:
+            return "Ошибка: укажи количество сообщений (count) от 1 до 100."
+        count = min(count, 100)
+        try:
+            # +1: не считаем само командное сообщение владельца частью лимита
+            deleted = await channel.purge(limit=count + 1, check=lambda m: m.id != message.id)
+            num = len([m for m in deleted if m.id != message.id])
+            return f"Удалено сообщений: {num}."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав для удаления сообщений (нужно право «Управление сообщениями»)."
+        except Exception as e:
+            return f"Ошибка при удалении сообщений: {e}"
+
+    elif name == "setup_logging":
+        category_name = str(args.get("category_name", "")).strip() or None
+        try:
+            ok, report = await setup_guild_logging(message.guild, category_name)
+            return report if ok else f"Не удалось развернуть логи: {report}"
+        except Exception as e:
+            return f"Ошибка при развёртывании логов: {e}"
 
     elif name == "mute_ai_for_user":
         if not user_id:
@@ -222,7 +380,6 @@ _last_user_call: dict[int, float] = {}
 _conversation_state: dict[int, dict] = {}
 _last_rate_limit_notice: dict[int, float] = {}
 _missing_key_warned = False
-_muted_users: set[tuple[int, int]] = set()
 # In-memory per-(guild, user) message cache — populated by remember_server_message.
 # Used by _format_author_profile to build behavioural context without hitting the DB.
 _user_memory: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=20))
@@ -243,6 +400,11 @@ DB_ADD_PATTERN = re.compile(r"\b(запомни|добавь\s+в\s+базу|з�
 DB_LIST_PATTERN = re.compile(r"\b(покажи\s+базу|список\s+базы|db\s+list)\b", re.IGNORECASE)
 DB_DELETE_PATTERN = re.compile(r"\b(удали\s+из\s+базы|db\s+delete|db\s+del)\b", re.IGNORECASE)
 CONTEXT_SCAN_PATTERN = re.compile(r"\b(обнови|просканируй|собери)\s+(?:контекст|память|историю)\b", re.IGNORECASE)
+SETUP_LOGGING_PATTERN = re.compile(
+    r"\b(разверни|развёрни|создай|настрой|подними|сделай|включи|добавь)\b[^\n]*?"
+    r"\b(логи|логов|логах|логирован\w*|лог[\s\-]?систем\w*|систему?\s+логов?|log[\s\-]?(?:s|system|channels)?)\b",
+    re.IGNORECASE,
+)
 USER_ID_PATTERN = re.compile(r"\b\d{17,21}\b")
 GUILD_ID_PATTERN = re.compile(r"(?:сервер|guild|server)\s*(?:id)?\s*[:#-]?\s*(\d{17,21})", re.IGNORECASE)
 QUOTED_TEXT_PATTERN = re.compile(r"[\"«']([^\"»']+)[\"»']")
@@ -252,6 +414,22 @@ def _strip_bot_mention(text: str, bot_id: int) -> str:
     if not text:
         return ""
     return text.replace(f"<@{bot_id}>", "").replace(f"<@!{bot_id}>", "").strip()
+
+
+def _strip_address_prefix(text: str, bot: discord.Client) -> str:
+    """#11: Снять обращение к боту в начале строки, вернуть тело команды.
+
+    Убирает ведущий меншен бота и имя P.OS/пос с разделителями, чтобы
+    последующий .match() видел глагол команды первым. Так "P.OS, забань ..."
+    распознаётся как команда, а "P.OS, думаешь стоит забанить?" — нет.
+    """
+    body = text or ""
+    if bot.user:
+        body = _strip_bot_mention(body, bot.user.id)
+    body = body.lstrip(" \t\n.,:;!—-")
+    # Снимаем ведущее имя бота (P.OS / П.ОС в разных написаниях) + разделители.
+    body = re.sub(r"^\s*(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)\b[\s,.:;!—-]*", "", body, flags=re.IGNORECASE)
+    return body.strip()
 
 
 def _is_image_attachment(att: discord.Attachment) -> bool:
@@ -476,14 +654,22 @@ def _format_guild_snapshot(message: discord.Message, bot: discord.Client) -> str
     if _is_owner_user(message):
         visible_guilds = ", ".join(f"{g.name} (`{g.id}`)" for g in bot.guilds[:20])
         servers_info = f"\nСерверы, где присутствует P.OS: {visible_guilds or 'нет данных'}."
+        # Полный список ролей сервера — чтобы модель сопоставляла названия с точными
+        # именами/ID и не отвечала «не знаю такую роль».
+        guild_roles = [r for r in guild.roles if r.name != "@everyone"]
+        guild_roles.sort(key=lambda r: r.position, reverse=True)
+        roles_list = "; ".join(f"{r.name} (`{r.id}`)" for r in guild_roles[:60])
+        roles_info = f"\nРоли сервера (имя и ID): {roles_list or 'нет данных'}."
     else:
         servers_info = ""
+        roles_info = ""
 
     return (
         f"Это ты — P.OS. Твой Discord ID: `{bot_id}`, твоё упоминание: {bot_mention}.\n"
         f"Сервер: {guild.name} (`{guild.id}`), участников: {guild.member_count or 'неизвестно'}.\n"
         f"Канал: #{getattr(message.channel, 'name', message.channel)} (`{message.channel.id}`)."
         + servers_info
+        + roles_info
     )
 
 
@@ -540,19 +726,8 @@ async def _collect_recent_media_attachments(message: discord.Message, limit: int
     return attachments
 
 
-def _mute_key(message: discord.Message) -> tuple[int, int] | None:
-    if not message.guild:
-        return None
-    return (message.guild.id, message.author.id)
-
-
 def _is_owner_user(message: discord.Message) -> bool:
     return message.author.id in POS_OWNER_USER_IDS
-
-
-def _is_user_muted(message: discord.Message) -> bool:
-    key = _mute_key(message)
-    return bool(key and key in _muted_users)
 
 
 def _is_mute_request(text: str) -> bool:
@@ -588,6 +763,65 @@ def build_pos_user_content(text: str, image_urls: list[str] | None = None):
 
 
 
+def _strip_address_prefix_from_reply(reply: str) -> str:
+    """Удаляет из ответа P.OS любые служебные «адресные» префиксы, которые модель
+    иногда копирует из контекста истории, вместо того чтобы просто ответить.
+
+    Discord и так показывает, кому P.OS отвечает (через reply), поэтому строки вида
+    'Отвечаю Имя (@login, ID: 123):' или 'Имя (@login, ID: 123):' в тексте — ошибка.
+    Срезаем их итеративно, на случай нескольких подряд.
+    """
+    if not reply:
+        return reply
+
+    cleaned = reply
+    # «Отвечаю/Ответ ...» в начале строки, опционально завершающееся ID/логином.
+    address_verb = (
+        r"^\s*(?:отвечаю|отвечая|обращаюсь(?:\s+к)?|ответ(?:\s+для|\s+пользователю)?|"
+        r"reply(?:\s+to)?|answering|responding(?:\s+to)?)\b"
+    )
+    # Для «голого» среза без ID берём только глаголы-обращения (не существительное
+    # «ответ»), чтобы не калечить нормальную фразу вида «Ответ на твой вопрос: ...».
+    address_verb_strict = (
+        r"^\s*(?:отвечаю|отвечая|обращаюсь(?:\s+к)?|answering|responding(?:\s+to)?)\b"
+    )
+    patterns = [
+        # [Ответ пользователю ...] / [Сообщение, на которое отвечает ...]
+        re.compile(
+            r"^\s*\[(?:Ответ\s+пользователю|Сообщение,\s+на\s+которое\s+отвечает[^\]]*)[^\]]*\]\s*",
+            re.IGNORECASE,
+        ),
+        # Имя (@login, ID: 123): | Имя (ID: 123): | Имя (@login):
+        re.compile(
+            r"^\s*[^@\n(]{1,60}?\s*\((?:@?[\w.\-]+\s*,\s*)?(?:ID|айди|id)\s*[:#]?\s*\d{5,}\)\s*:?\s*",
+            re.IGNORECASE,
+        ),
+        # Отвечаю/Ответ ... [Имя] [(@login)] [ID: 123] :
+        re.compile(
+            address_verb + r"[^:\n]*?(?:ID|айди)\s*[:#]?\s*\d{5,}[^:\n]*:?\s*",
+            re.IGNORECASE,
+        ),
+        # Отвечаю Имени/пользователю Имя: (без ID, но с двоеточием в конце фразы)
+        re.compile(address_verb_strict + r"[^:\n]{0,60}:\s*", re.IGNORECASE),
+        # Голый префикс с ником и ID без имени: (@login, ID: 123):
+        re.compile(
+            r"^\s*\(@?[\w.\-]+\s*,\s*(?:ID|айди)\s*[:#]?\s*\d{5,}\)\s*:?\s*",
+            re.IGNORECASE,
+        ),
+    ]
+
+    changed = True
+    while changed and cleaned:
+        changed = False
+        for pat in patterns:
+            m = pat.match(cleaned)
+            if m and m.end() > 0:
+                cleaned = cleaned[m.end():]
+                changed = True
+                break
+    return cleaned.strip() or reply.strip()
+
+
 async def request_pos_reply(bot: discord.Client, message: discord.Message | None, messages: list[dict], *, allow_system_fallback: bool = True) -> str | None:
     MAX_TURNS = 5
     for turn in range(MAX_TURNS):
@@ -599,60 +833,29 @@ async def request_pos_reply(bot: discord.Client, message: discord.Message | None
             top_p=POS_AI_TOP_P,
             timeout=POS_AI_TIMEOUT_SECONDS,
         )
-        
+
         if not response_msg:
             return None
-            
+
         tool_calls = response_msg.get("tool_calls")
         if not tool_calls:
             reply = response_msg.get("content")
             if reply:
-                import re
-                cleaned_reply = reply
-                while True:
-                    # Match bracketed prefixes
-                    match = re.match(
-                        r"^\s*\[(?:Ответ\s+пользователю|Сообщение,\s+на\s+которое\s+отвечает\s+пользователь)[^\]]*\]\s*",
-                        cleaned_reply,
-                        re.IGNORECASE
-                    )
-                    if match:
-                        cleaned_reply = cleaned_reply[match.end():]
-                        continue
-                    
-                    # Match user prefixes "Name (@username, ID: 123):"
-                    match_user = re.match(
-                        r"^\s*[^@\n]+?\s*\(@?[a-zA-Z0-9_.-]+?,\s*ID:\s*\d+?\):\s*",
-                        cleaned_reply,
-                        re.IGNORECASE
-                    )
-                    if match_user:
-                        cleaned_reply = cleaned_reply[match_user.end():]
-                        continue
-
-                    # Match plain "Ответ пользователю ...:"
-                    match_nobracket = re.match(
-                        r"^\s*(?:Ответ\s+пользователю|Сообщение,\s+на\s+которое\s+отвечает\s+пользователь)\s+[^:\n]+:\s*",
-                        cleaned_reply,
-                        re.IGNORECASE
-                    )
-                    if match_nobracket:
-                        cleaned_reply = cleaned_reply[match_nobracket.end():]
-                        continue
-
-                    break
-                reply = cleaned_reply.strip()
+                reply = _strip_address_prefix_from_reply(reply)
             return reply
             
         messages.append(response_msg)
         
         for tool_call in tool_calls:
             tool_id = tool_call.get("id")
-            result = await execute_pos_tool(bot, message, tool_call)
+            try:
+                result = await execute_pos_tool(bot, message, tool_call)
+            except Exception as e:
+                result = f"Ошибка при выполнении инструмента: {e}"
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_id,
-                "name": tool_call["function"]["name"],
+                "name": tool_call.get("function", {}).get("name"),
                 "content": result
             })
             
@@ -852,6 +1055,7 @@ def _format_owner_help(bot: discord.Client) -> str:
         "`P.OS добавь роль @роль @user` — выдать роль.\n"
         "`P.OS сними роль @роль @user` — снять роль.\n"
         "`P.OS обнови контекст` — собрать свежую память по доступным каналам сервера.\n"
+        "`P.OS разверни логи` — создать категорию и каналы логов на этом сервере (видны только админам).\n"
         "`P.OS инвайт` или `P.OS инвайт [имя сервера]` — создать приглашение.\n"
 
         "`P.OS запомни Заголовок: текст` — записать факт в базу.\n"
@@ -969,7 +1173,7 @@ async def _build_messages(
                 SYSTEM_INSTRUCTION
                 + "\nТы видишь многопользовательский контекст сервера. У каждого пользователя есть своё имя и ID, которые передаются в префиксе его сообщений: 'Имя (@username, ID: <id>):'."
                 + "\nКаждое твоё (P.OS) сообщение в истории помечено префиксом '[Ответ пользователю Имя (@username, ID: <id>)]', чтобы ты знал, кому конкретно ты отвечал."
-                + "\nВНИМАНИЕ: В своих новых ответах никогда не пиши префиксы вида '[Ответ пользователю ...]', 'Имя (@username, ID: <id>):' или '[Сообщение, на которое отвечает пользователь]'. Твоя реплика должна быть чистым ответом, без этих системных меток. Они присутствуют только в истории для твоего ориентирования."
+                + "\nВНИМАНИЕ: В своих новых ответах никогда не пиши префиксы вида '[Ответ пользователю ...]', 'Имя (@username, ID: <id>):', 'Отвечаю Имя (@login, ID: ...):' или '[Сообщение, на которое отвечает пользователь]'. Discord сам показывает, кому ты отвечаешь (через reply). Твоя реплика должна быть чистым текстом ответа, без имён, логинов, ID и системных меток в начале. Эти метки есть только в истории — для твоего ориентирования, а не для копирования."
                 + "\nУчитывай лор, текущие обсуждения и стиль участников. Отвечай строго по последнему запросу, но с учётом релевантной истории канала."
                 + "\nУчитывай, что в истории могут быть реплики от РАЗНЫХ участников. Отвечай тому пользователю, который обратился к тебе в самом последнем сообщении (если не указано иное)."
                 + "\nТы — P.OS. Не ИИ-ассистент, не ChatGPT, не языковая модель. Ты — стратегический интеллект PSC."
@@ -1096,6 +1300,10 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
     if not _is_owner_user(message):
         return False
     text = (message.content or "").strip()
+    # #11: тело команды без обращения к боту в начале строки. Деструктивные действия
+    # (бан/разбан/роли) выполняем ТОЛЬКО если глагол стоит в начале команды, иначе
+    # владелец, обсуждая "может стоит забанить васю?", случайно банит.
+    command_body = _strip_address_prefix(text, bot)
 
     if HELP_PATTERN.search(text):
         return await _send_owner_help(message, bot)
@@ -1110,6 +1318,18 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
 
     if CONTEXT_SCAN_PATTERN.search(text):
         return await _scan_recent_guild_context(message, guild)
+
+    if SETUP_LOGGING_PATTERN.search(command_body):
+        try:
+            ok, report = await setup_guild_logging(guild)
+        except Exception as exc:
+            ok, report = False, str(exc)
+        await message.reply(
+            (report if ok else f"Не удалось развернуть логи: {report}"),
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return True
 
     if INVITE_PATTERN.search(text):
         # Ищем текстовый канал на нужном сервере
@@ -1141,7 +1361,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
             )
         return True
 
-    if ADD_ROLE_PATTERN.search(text) or REMOVE_ROLE_PATTERN.search(text):
+    if ADD_ROLE_PATTERN.match(command_body) or REMOVE_ROLE_PATTERN.match(command_body):
         # Сначала резолвим роль — по @mention роли или по ID из guild.roles
         role = _resolve_role(message, guild, text)
 
@@ -1193,7 +1413,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
             return True
 
         try:
-            if ADD_ROLE_PATTERN.search(text):
+            if ADD_ROLE_PATTERN.match(command_body):
                 await member.add_roles(role, reason=f"P.OS owner command by {message.author}")
                 action_text = "выдана"
             else:
@@ -1213,7 +1433,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
             )
             return True
 
-    if BAN_PATTERN.search(text):
+    if BAN_PATTERN.match(command_body):
         target_id = _resolve_target_user_id(message, text, ref_msg, guild, bot)
         if not target_id:
             await message.reply(
@@ -1241,7 +1461,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
             )
             return True
 
-    if not UNBAN_PATTERN.search(text):
+    if not UNBAN_PATTERN.match(command_body):
         return False
 
     target_id: int | None = None
@@ -1288,6 +1508,21 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
         return True
 
 
+def check_user_cooldown(user_id: int, *, update: bool = True) -> bool:
+    """#6: Единая проверка per-user кулдауна для запросов к P.OS.
+
+    Возвращает True, если пользователь СЕЙЧАС на кулдауне (запрос надо отклонить).
+    При update=True и отсутствии кулдауна обновляет отметку времени.
+    """
+    now = time.time()
+    last = _last_user_call.get(user_id, 0.0)
+    if now - last < AI_COOLDOWN_SECONDS:
+        return True
+    if update:
+        _last_user_call[user_id] = now
+    return False
+
+
 def _trim_cache_if_needed() -> None:
     """#4: Обрезаем глобальные кэши при превышении лимита."""
     if len(_last_user_call) > _MAX_CACHE_SIZE:
@@ -1326,10 +1561,10 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         return True
 
     text = message.content or ""
-    mute_key = _mute_key(message)
     if _is_mute_request(text):
-        if mute_key:
-            _muted_users.add(mute_key)
+        # #9: пишем мут в БД (единый источник истины), чтобы он переживал рестарт
+        # и совпадал с tool-инструментом mute_ai_for_user.
+        await set_ai_muted_user(message.author.id, message.guild.id, True)
         await message.reply(
             "Принято. Для тебя в этом сервере замолкаю до команды на возврат.",
             mention_author=False,
@@ -1338,8 +1573,7 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         return True
 
     if _is_unmute_request(text):
-        if mute_key:
-            _muted_users.discard(mute_key)
+        await set_ai_muted_user(message.author.id, message.guild.id, False)
         await message.reply(
             "Принято. Снова на связи и готов работать по твоим запросам.",
             mention_author=False,
@@ -1394,11 +1628,8 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
             )
             return True
 
-    now = time.time()
-    last = _last_user_call.get(message.author.id, 0.0)
-    if now - last < AI_COOLDOWN_SECONDS:
+    if check_user_cooldown(message.author.id):
         return False
-    _last_user_call[message.author.id] = now
 
     if not POS_AI_API_KEY:
         if not _missing_key_warned:

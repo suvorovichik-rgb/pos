@@ -1,26 +1,14 @@
 from __future__ import annotations
 
-import os
 import shutil
-import tempfile
-import uuid
-import asyncio
 import logging
 
 import discord
-from PIL import Image, ImageOps
-from discord import Embed, Color
+from discord import Color
 from discord.ext import commands, tasks
-
-try:
-    from moviepy import VideoFileClip, vfx
-except Exception:
-    VideoFileClip = None
-    vfx = None
 
 from config import (
     allowed_guild_ids,
-    allowed_role_ids,
     UPDATE_LOG_CHANNEL_ID,
     UPDATE_LOG_MARKER,
 )
@@ -30,8 +18,6 @@ from utils import collect_runtime_health
 # Из commands.py
 from commands import (
     generate_gif_from_attachments,
-    _is_image_attachment,
-    sbor_channels,
     parse_gif_options_from_text,
 )
 
@@ -54,12 +40,12 @@ async def _send_update_log_if_needed(bot: commands.Bot):
 
     release_message = (
         f"[{UPDATE_LOG_MARKER}]\n"
-        "Лог обновления P.S.C Helper (v0.5.1):\n"
-        "- увеличена длина ответа ИИ до 2048 токенов (сообщения больше не обрезаются);\n"
-        "- исправлена ошибка валидации тайм-аута (minutes) на стороне ИИ-провайдеров;\n"
-        "- настроено автоматическое резервное копирование и восстановление базы данных SQLite (bot_data.db) через Discord;\n"
-        "- автомодерация переведена на высокоточный Gemini API для исключения ложных мутов;\n"
-        "- улучшена отказоустойчивость ИИ-клиента при сбоях провайдеров."
+        "Лог обновления P.S.C Helper — версия 0.7:\n"
+        "- P.OS закрепил идентичность: Provision Operating System (P-O.S);\n"
+        "- улучшено распознавание ответов — без служебных префиксов с ником и ID;\n"
+        "- P.OS по команде разворачивает систему логов (каналы видны только админам);\n"
+        "- новые приветствия и прощания участников в нескольких каналах;\n"
+        "- укреплена защита tool-вызовов и обработка ошибок AI."
     )
 
     try:
@@ -71,6 +57,10 @@ async def _send_update_log_if_needed(bot: commands.Bot):
 class GeneralCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # #2: on_ready срабатывает при КАЖDOM реконнекте. Восстановление БД
+        # должно выполняться один раз за процесс, иначе свежие данные затираются
+        # последним бэкапом после любого обрыва соединения.
+        self._restored_once = False
         self.db_backup_task.start()
 
     def cog_unload(self):
@@ -88,16 +78,19 @@ class GeneralCog(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         logger.info(f"✅ Бот запущен как {self.bot.user} (id: {self.bot.user.id})")
-        
-        try:
-            from storage import restore_db_from_discord
-            did_restore = await restore_db_from_discord(self.bot)
-            if did_restore:
-                logger.info("✅ База данных успешно восстановлена из Discord резервной копии.")
-            else:
-                logger.info("ℹ️ Резервная копия базы данных не найдена на Discord. Сессия с чистого листа.")
-        except Exception as e:
-            logger.error(f"Ошибка при восстановлении базы данных: {e}", exc_info=True)
+
+        # #2: восстанавливаем БД только один раз за процесс, а не на каждый reconnect.
+        if not self._restored_once:
+            self._restored_once = True
+            try:
+                from storage import restore_db_from_discord
+                did_restore = await restore_db_from_discord(self.bot)
+                if did_restore:
+                    logger.info("✅ База данных успешно восстановлена из Discord резервной копии.")
+                else:
+                    logger.info("ℹ️ Резервная копия базы данных не найдена на Discord. Сессия с чистого листа.")
+            except Exception as e:
+                logger.error(f"Ошибка при восстановлении базы данных: {e}", exc_info=True)
         runtime = collect_runtime_health()
         missing_optional = [k for k, available in runtime.items() if not available and k != "DISCORD_TOKEN"]
         if missing_optional:
@@ -167,114 +160,6 @@ class GeneralCog(commands.Cog):
         finally:
             if "temp_dir" in locals():
                 shutil.rmtree(temp_dir, ignore_errors=True)
-
-    @commands.command(name="health")
-    async def health(self, ctx: commands.Context):
-        runtime = collect_runtime_health()
-        status_lines = [
-            f"`{name}`: {'✅ OK' if enabled else '⚠️ отсутствует'}"
-            for name, enabled in runtime.items()
-        ]
-
-        embed = Embed(
-            title="Состояние бота",
-            description="\n".join(status_lines),
-            color=Color.green() if runtime["DISCORD_TOKEN"] else Color.orange(),
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.add_field(name="Latency", value=f"`{round(self.bot.latency * 1000)}ms`", inline=False)
-        embed.add_field(name="P.OS Core", value="`operational`", inline=True)
-        embed.add_field(name="P.OS Profile", value="`PSC-2058`", inline=True)
-        await ctx.send(embed=embed)
-
-    @discord.app_commands.command(name="sbor", description="Начать сбор: создаёт голосовой канал и пингует роль")
-    @discord.app_commands.describe(role="Роль, которую нужно пинговать")
-    async def sbor(self, interaction: discord.Interaction, role: discord.Role):
-        if interaction.guild.id not in allowed_guild_ids:
-            await interaction.response.send_message("❌ Команда недоступна на этом сервере.", ephemeral=True)
-            return
-
-        member = interaction.guild.get_member(interaction.user.id)
-        if not member or not any(r.id in allowed_role_ids for r in member.roles):
-            await interaction.response.send_message("❌ У тебя нет прав для этой команды.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-        existing = discord.utils.get(interaction.guild.voice_channels, name="сбор")
-        if existing:
-            await interaction.followup.send("❗ Канал 'сбор' уже существует.")
-            return
-
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(connect=False),
-            role: discord.PermissionOverwrite(connect=True, view_channel=True)
-        }
-
-        category = interaction.channel.category
-        voice_channel = await interaction.guild.create_voice_channel("Сбор", overwrites=overwrites, category=category)
-        sbor_channels[interaction.guild.id] = voice_channel.id
-
-        webhook = await interaction.channel.create_webhook(name="Сбор")
-        await webhook.send(
-            content=f"**Сбор! {role.mention}. Заходите в <#{voice_channel.id}>!**",
-            username="Сбор",
-            avatar_url=self.bot.user.avatar.url if self.bot.user.avatar else None
-        )
-        await webhook.delete()
-
-        try:
-            await send_log_embed(
-                interaction.guild,
-                "commands",
-                "📣 Сбор создан",
-                f"{interaction.user.mention} создал сбор.",
-                color=Color.blue(),
-                fields=[
-                    ("Роль", role.mention, False),
-                    ("Канал", voice_channel.mention, False)
-                ]
-            )
-        except Exception:
-            pass
-        await interaction.followup.send("✅ Сбор создан!")
-
-    @discord.app_commands.command(name="sbor_end", description="Завершить сбор и удалить голосовой канал")
-    async def sbor_end(self, interaction: discord.Interaction):
-        if interaction.guild.id not in allowed_guild_ids:
-            await interaction.response.send_message("❌ Команда недоступна на этом сервере.", ephemeral=True)
-            return
-
-        member = interaction.guild.get_member(interaction.user.id)
-        if not member or not any(r.id in allowed_role_ids for r in member.roles):
-            await interaction.response.send_message("❌ У тебя нет прав для этой команды.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-        channel_id = sbor_channels.get(interaction.guild.id)
-        if not channel_id:
-            await interaction.followup.send("❗ Канал 'сбор' не найден.")
-            return
-
-        channel = interaction.guild.get_channel(channel_id)
-        if channel:
-            await channel.delete()
-
-        webhook = await interaction.channel.create_webhook(name="Сбор")
-        await webhook.send(content="*Сбор окончен!*", username="Сбор", avatar_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
-        await webhook.delete()
-        sbor_channels.pop(interaction.guild.id, None)
-
-        try:
-            await send_log_embed(
-                interaction.guild,
-                "commands",
-                "🧹 Сбор завершён",
-                f"{interaction.user.mention} завершил сбор.",
-                color=Color.orange()
-            )
-        except Exception:
-            pass
-        await interaction.followup.send("✅ Сбор завершён.")
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(GeneralCog(bot))
