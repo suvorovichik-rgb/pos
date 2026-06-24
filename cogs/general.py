@@ -9,8 +9,6 @@ from discord.ext import commands, tasks
 
 from config import (
     allowed_guild_ids,
-    UPDATE_LOG_CHANNEL_ID,
-    UPDATE_LOG_MARKER,
 )
 from logging_utils import send_log_embed, ensure_log_category_and_channels
 from utils import collect_runtime_health
@@ -22,36 +20,6 @@ from commands import (
 )
 
 logger = logging.getLogger(__name__)
-
-async def _send_update_log_if_needed(bot: commands.Bot):
-    if not UPDATE_LOG_CHANNEL_ID:
-        return
-
-    channel = bot.get_channel(UPDATE_LOG_CHANNEL_ID)
-    if not isinstance(channel, discord.TextChannel):
-        return
-
-    try:
-        async for existing in channel.history(limit=20):
-            if existing.author.id == bot.user.id and UPDATE_LOG_MARKER in (existing.content or ""):
-                return
-    except Exception:
-        return
-
-    release_message = (
-        f"[{UPDATE_LOG_MARKER}]\n"
-        "Лог обновления P.S.C Helper — версия 0.7:\n"
-        "- P.OS закрепил идентичность: Provision Operating System (P-O.S);\n"
-        "- улучшено распознавание ответов — без служебных префиксов с ником и ID;\n"
-        "- P.OS по команде разворачивает систему логов (каналы видны только админам);\n"
-        "- новые приветствия и прощания участников в нескольких каналах;\n"
-        "- укреплена защита tool-вызовов и обработка ошибок AI."
-    )
-
-    try:
-        await channel.send(release_message, allowed_mentions=discord.AllowedMentions.none())
-    except Exception as e:
-        logger.error(f"Failed to send update log: {e}", exc_info=True)
 
 
 class GeneralCog(commands.Cog):
