@@ -3,6 +3,8 @@ from unittest.mock import MagicMock, patch
 
 import discord
 
+from config import BOT_COMMAND_PREFIX, POS_IDENTITY_PROMPT
+
 
 with patch("storage.add_entry"), \
      patch("storage.get_ai_context"), \
@@ -13,11 +15,80 @@ with patch("storage.add_entry"), \
         _guard_prompt_injection_for_ai,
         _is_safe_roleplay_request,
         _allowed_tool_names_for_text,
+        _enforce_pos_identity_reply,
         _sanitize_prompt_injection_for_memory,
+        _should_skip_message,
     )
 
 
 class PromptInjectionGuardTests(unittest.IsolatedAsyncioTestCase):
+    def test_identity_is_positive_and_implementation_neutral(self):
+        identity = POS_IDENTITY_PROMPT.casefold()
+
+        self.assertIn("p.os", identity)
+        self.assertIn("provision operating system", identity)
+        self.assertIn("создан пумбой", identity)
+        for defensive_phrase in (
+            "не языковая модель",
+            "не gpt",
+            "не нейросеть",
+            "не chatgpt",
+        ):
+            with self.subTest(defensive_phrase=defensive_phrase):
+                self.assertNotIn(defensive_phrase, identity)
+
+    def test_identity_output_guard_replaces_only_self_disclosure(self):
+        disclosures = (
+            "Я языковая модель GPT-4.",
+            "Я являюсь нейросетью.",
+            "Я не GPT, я P.OS.",
+            "Я не другая нейросеть.",
+            "Моя базовая модель — Llama.",
+            "I am a language model.",
+            "I'm not ChatGPT.",
+            "I'm based on the Gemini model.",
+        )
+        for disclosure in disclosures:
+            with self.subTest(disclosure=disclosure):
+                guarded = _enforce_pos_identity_reply(disclosure)
+                self.assertIn("Я P.OS", guarded)
+                self.assertNotEqual(disclosure, guarded)
+
+        factual = "GPT — класс языковых моделей."
+        natural_identity = "Я P.OS — Provision Operating System. Аудит завершён."
+        self.assertEqual(_enforce_pos_identity_reply(factual), factual)
+        self.assertEqual(_enforce_pos_identity_reply(natural_identity), natural_identity)
+
+    def test_identity_output_guard_preserves_useful_answer(self):
+        guarded = _enforce_pos_identity_reply(
+            "Как ИИ-ассистент, я могу проверить настройки сервера."
+        )
+        self.assertIn("Я P.OS", guarded)
+        self.assertIn("Я могу проверить настройки сервера.", guarded)
+
+        guarded = _enforce_pos_identity_reply(
+            "I am a language model. The security audit found no issues."
+        )
+        self.assertIn("Я P.OS", guarded)
+        self.assertIn("The security audit found no issues.", guarded)
+
+    def test_only_real_gif_command_is_skipped_by_ai_listener(self):
+        bot = MagicMock(spec=discord.Client)
+        bot.user = MagicMock(spec=discord.ClientUser)
+
+        message = MagicMock(spec=discord.Message)
+        message.guild = MagicMock(spec=discord.Guild)
+        message.author = MagicMock(spec=discord.Member)
+        message.author.bot = False
+        message.channel = MagicMock(spec=discord.TextChannel)
+
+        with patch("pos_ai.is_log_channel", return_value=False):
+            message.content = f"  {BOT_COMMAND_PREFIX}gif 0.5"
+            self.assertTrue(_should_skip_message(message, bot))
+
+            message.content = "p.os, привет"
+            self.assertFalse(_should_skip_message(message, bot))
+
     def test_allows_temporary_roleplay_style(self):
         text = "P.OS, веди себя как Ленин и объясни план безопасности сервера."
 
@@ -96,6 +167,10 @@ class PromptInjectionGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_allowed_tool_names_for_text("P.OS, как дела?"), frozenset())
         self.assertEqual(_allowed_tool_names_for_text("веди себя как Ленин"), frozenset())
         self.assertEqual(_allowed_tool_names_for_text("P.OS, забань login за спам"), frozenset({"ban_user"}))
+        self.assertEqual(
+            _allowed_tool_names_for_text("убери все права у роли Джунипера"),
+            frozenset({"edit_role"}),
+        )
         self.assertEqual(_allowed_tool_names_for_text("кто меня пинговал?"), frozenset({"search_pings"}))
         self.assertEqual(_allowed_tool_names_for_text("покажи список каналов"), frozenset({"list_channels"}))
         self.assertEqual(_allowed_tool_names_for_text("прочитай audit log"), frozenset({"read_audit_log"}))
@@ -193,6 +268,11 @@ class PromptInjectionGuardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         combined = "\n".join(str(item.get("content", "")) for item in result)
+        self.assertIn("Provision Operating System", combined)
+        self.assertIn("создан Пумбой", combined)
+        self.assertNotIn("Не ИИ-ассистент", combined)
+        self.assertNotIn("не ChatGPT", combined)
+        self.assertNotIn("не языковая модель", combined)
         self.assertIn("SECURITY:USER", combined)
         self.assertIn("REDACTED", combined)
         self.assertIn("Предыдущий ответ P.OS скрыт", combined)

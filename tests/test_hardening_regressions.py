@@ -12,7 +12,7 @@ import cogs.logging_events as logging_events
 import storage
 from message_gate import begin_moderation, finish_moderation, wait_for_moderation
 from moderation import extract_urls
-from pos_ai import request_pos_reply
+from pos_ai import _extract_textual_tool_calls, request_pos_reply
 from storage import close_all_connections, restore_db_from_discord
 
 
@@ -35,6 +35,22 @@ class UrlExtractionTests(unittest.TestCase):
 
 
 class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
+    def test_textual_tool_parser_rejects_code_and_unapproved_tools(self):
+        self.assertEqual(
+            _extract_textual_tool_calls(
+                "tool_call: kick_user(user_id=__import__('os').getuid())",
+                frozenset({"kick_user"}),
+            ),
+            [],
+        )
+        self.assertEqual(
+            _extract_textual_tool_calls(
+                "tool_call: kick_user(user_id='123')",
+                frozenset({"ban_user"}),
+            ),
+            [],
+        )
+
     async def test_only_intended_schema_is_exposed_and_duplicate_call_is_skipped(self):
         tool_call = {
             "id": "call-1",
@@ -63,7 +79,7 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state["tools_executed"])
         self.assertIn("Повторный идентичный вызов пропущен", result)
 
-    async def test_non_owner_is_never_given_tool_schemas(self):
+    async def test_non_owner_gets_only_mutating_schema_for_owner_approval(self):
         message = SimpleNamespace(
             content="P.OS, забань пользователя test",
             author=SimpleNamespace(id=123),
@@ -74,7 +90,38 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             result = await request_pos_reply(SimpleNamespace(), message, [])
 
         self.assertEqual(result, "Нет доступа.")
-        self.assertIsNone(chat.await_args.kwargs["tools"])
+        schemas = chat.await_args.kwargs["tools"]
+        self.assertEqual([schema["function"]["name"] for schema in schemas], ["ban_user"])
+
+    async def test_textual_tool_call_from_provider_is_executed(self):
+        response = {
+            "role": "assistant",
+            "content": (
+                "Принято. Выполняю устранение JuniperBot (`1351879409832951893`) с сервера.\n\n"
+                "tool_call: kick_user(user_id='1351879409832951893', "
+                "reason='По приказу владельца')"
+            ),
+        }
+        message = SimpleNamespace(
+            content="кикни бота джунипера с сервера",
+            author=SimpleNamespace(id=968698192411652176),
+        )
+        state = {"tools_executed": False}
+        chat = AsyncMock(return_value=response)
+        execute = AsyncMock(return_value="JuniperBot кикнут с сервера.")
+
+        with patch("pos_ai.pos_chat_completion", new=chat), \
+             patch("pos_ai.execute_pos_tool", new=execute):
+            result = await request_pos_reply(SimpleNamespace(), message, [], state=state)
+
+        self.assertEqual(result, "JuniperBot кикнут с сервера.")
+        self.assertTrue(state["tools_executed"])
+        call = execute.await_args.args[2]
+        self.assertEqual(call["function"]["name"], "kick_user")
+        self.assertEqual(
+            json.loads(call["function"]["arguments"])["user_id"],
+            "1351879409832951893",
+        )
 
 
 class RestoreFallbackTests(unittest.IsolatedAsyncioTestCase):
