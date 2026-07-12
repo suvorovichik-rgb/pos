@@ -35,16 +35,16 @@ If you try PSC-HELPER, an issue describing your server size and setup helps the 
 
 - **Automated moderation** — deterministic link and executable-attachment screening, normalized spam detection, AI-assisted review, mass-mention protection, and persistent anti-raid state
 - **P.OS AI assistant** — responds to mentions and replies, keeps conversational context, supports vision inputs
-- **Owner-gated tools** — factual server inspection plus confirmed bans, timeouts, roles, channels, settings, and cross-server actions; enforced in code, not prompt-only
+- **Owner-gated tools** — factual server inspection plus bans, timeouts, roles, channels, settings, and cross-server actions; owner commands execute directly, third-party requests require approval
 - **Application workflows** — interactive forms for applications, reports, and staff review
 - **Audit logging** — structured server event journals and a persistent, redacted history of P.OS tool activity
 - **Media utilities** — adaptive `p.gif` conversion that preserves animation timing and searches for the best quality that fits the server upload limit
 
 ## Security model (important)
 
-High-privilege operations are **never delegated directly to the LLM**. The model may request actions through tool calls; `pos_ai.py` resolves targets to canonical Discord IDs, checks permissions and role hierarchy, protects the owner and bot, and requires an out-of-band confirmation before execution.
+High-privilege operations are **never delegated directly to the LLM**. The model may request actions through tool calls; `pos_ai.py` resolves targets to canonical Discord IDs, checks the current message's intent, permissions and role hierarchy, and protects the owner and bot before execution.
 
-The only privileged operator is Pumba, identified by the immutable Discord user ID `968698192411652176`. This trust boundary cannot be expanded through an environment variable. Read-only factual tools may run immediately for Pumba; every state-changing action is sent to Pumba's DM for explicit button confirmation and expires after 10 minutes.
+The only direct privileged operator is Pumba, identified by the immutable Discord user ID `968698192411652176`. This trust boundary cannot be expanded through an environment variable. Pumba's verified Discord actions execute immediately and return the factual API result. A state-changing request from anyone else is sent to Pumba's DM for explicit button approval and expires after 10 minutes. Process shutdown still requires Pumba's separate confirmation.
 
 AI moderation findings are advisory unless a deterministic signal or independently confirmed visual signal reaches the required confidence threshold. This prevents a model response or prompt-injected message from becoming an automatic punishment by itself.
 
@@ -106,7 +106,7 @@ POS_AI_PROVIDER_MODELS=openai/gpt-4.1,openai/gpt-4.1
 
 ### Other useful settings
 
-- `POS_AI_SYSTEM_PROMPT` — override P.OS persona prompt
+- `POS_AI_SYSTEM_PROMPT` — optional owner context appended to the immutable P.OS identity and safety core
 - `POS_AI_MAX_TOKENS`, `POS_AI_TEMPERATURE`, `POS_AI_TOP_P`, `POS_AI_TIMEOUT_SECONDS`, `POS_AI_MAX_CONCURRENT_REQUESTS`
 - `PRIMARY_LOG_CHANNEL_ID`, `UPDATE_LOG_CHANNEL_ID`, `LOG_CATEGORY_ID`, `LOG_CATEGORY_NAME`
 - `DB_BACKUP_CHANNEL_ID` — Discord channel for SQLite backup uploads (recommended on Railway)

@@ -55,7 +55,7 @@ When changing AI or moderation behavior, edit the top-level module, not the cog.
 All env parsing and hardcoded Discord IDs (channels, roles, guilds) live here. Read this first when behavior depends on a specific channel/role. Helpers: `_env_int`, `_env_float`, `_env_csv`, `_env_int_list`. Key points:
 - AI provider resolution is layered for backward compatibility: `GITHUB_MODELS_TOKEN` → falls back to `POS_AI_API_KEY` → `NVIDIA_API_KEY`. `POS_AI_PROVIDER` is `"github_models"` when a GitHub token is present, else `"generic_openai_compatible"`.
 - `POS_OWNER_USER_IDS` always includes the hardcoded owner ID `968698192411652176` (Pumba), merged with the env list.
-- Link-filtering lists (`SUSPICIOUS_*`, `WHITELIST_DOMAINS`, keyword lists) and the default `POS_AI_SYSTEM_PROMPT` (the P.OS persona) are defined here.
+- Link-filtering lists (`SUSPICIOUS_*`, `WHITELIST_DOMAINS`, keyword lists) and the immutable P.OS identity/safety core are defined here. `POS_AI_SYSTEM_PROMPT` may extend that core but cannot replace it.
 
 ### AI client (`ai_client.py`)
 `pos_chat_completion()` is the single entry point for all model calls (both P.OS chat and Gemini-based moderation, selected via `provider_type=`). It implements an OpenAI-compatible client with a **provider pool** (`POS_AI_PROVIDER_KEYS/URLS/MODELS`, CSV, index-aligned) for rate-limit spreading. Features: round-robin provider cursor, per-provider and global backoff/cooldown with `Retry-After` parsing, automatic failover to the next provider on 429/5xx, and tolerant response parsing (`_extract_message_from_payload`, `extract_json_block`). Returns `None` on failure rather than raising — callers must handle `None`.
@@ -64,7 +64,7 @@ All env parsing and hardcoded Discord IDs (channels, roles, guilds) live here. R
 The largest module. `handle_pos_ai(message, bot)` decides whether P.OS should respond (mention, reply, name-mention, ongoing context), builds the message payload via `_build_messages` (system prompt + chronological channel history with per-author identity headers + guild/author/server-memory snapshots), and calls `request_pos_reply`. Supports image/video vision inputs and a `p.gif`-style request path.
 
 **Tool-call security model (critical):** the model can emit tool calls (`ban_user`, `unban_user`, `timeout_user`, `add_role`, `remove_role`, `mute_ai_for_user`, `unmute_ai_for_user`), but `execute_pos_tool` enforces the policy in code, not in the prompt:
-- Tools in `_OWNER_ONLY_TOOLS` are refused unless `message.author.id` is in `POS_OWNER_USER_IDS`; instead a confirmation request is DM'd to the owner.
+- Pumba's commands are authenticated by the immutable creator ID and execute immediately after intent, target, permission, and hierarchy checks. State-changing requests from other users are DM'd to Pumba for approval; owner-only factual reads are denied to outsiders.
 - The owner and the bot itself are protected from being targeted by any tool.
 Never let the model perform privileged actions directly — keep the verified code layer between AI intent and execution.
 
